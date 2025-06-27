@@ -23,7 +23,7 @@ public:
         }
 
         timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(20),
+            std::chrono::milliseconds(1),
             std::bind(&JointSerialPublisher::readAndPublish, this)
         );
     }
@@ -68,7 +68,10 @@ private:
                 double angle = value - joint_id * 1000;
 
                 if (joint_id >= 0 && joint_id < 5) {
-                    joint_state_.position[joint_id] = angle;
+                    if(angle != 0){
+                        joint_state_.position[joint_id] = angle;
+                    }
+                    
                 }
 
                 joint_state_.header.stamp = this->get_clock()->now();
