@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <thread>
 
 class JointSerialPublisher : public rclcpp::Node {
 public:
@@ -20,72 +21,85 @@ public:
         if (!initSerial("/dev/ttyACM0", B115200)) {
             RCLCPP_ERROR(this->get_logger(), "Failed to open serial port.");
             rclcpp::shutdown();
+            return;
         }
 
-        timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(1),
-            std::bind(&JointSerialPublisher::readAndPublish, this)
-        );
+        running_ = true;
+        read_thread_ = std::thread(&JointSerialPublisher::readLoop, this);
+    }
+
+    ~JointSerialPublisher() {
+        running_ = false;
+        if (read_thread_.joinable()) {
+            read_thread_.join();
+        }
+        if (fd_ >= 0) close(fd_);
     }
 
 private:
     bool initSerial(const char* portname, int baudrate) {
-        fd_ = open(portname, O_RDWR | O_NOCTTY | O_SYNC);
+        fd_ = open(portname, O_RDWR | O_NOCTTY | O_NONBLOCK); // 非ブロッキングモード
         if (fd_ < 0) return false;
 
-        struct termios tty;
-        memset(&tty, 0, sizeof tty);
+        struct termios tty{};
         if (tcgetattr(fd_, &tty) != 0) return false;
 
         cfsetospeed(&tty, baudrate);
         cfsetispeed(&tty, baudrate);
 
         tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
-        tty.c_iflag &= ~IGNBRK;
+        tty.c_iflag = 0;
         tty.c_lflag = 0;
         tty.c_oflag = 0;
-        tty.c_cc[VMIN] = 1;
+        tty.c_cc[VMIN] = 0;
         tty.c_cc[VTIME] = 1;
-        tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+
         tty.c_cflag |= (CLOCAL | CREAD);
-        tty.c_cflag &= ~(PARENB | PARODD);
-        tty.c_cflag &= ~CSTOPB;
-        tty.c_cflag &= ~CRTSCTS;
+        tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CRTSCTS);
 
         return tcsetattr(fd_, TCSANOW, &tty) == 0;
     }
 
-    void readAndPublish() {
+    void readLoop() {
         char ch;
-        static char buffer[256];
-        static int idx = 0;
+        char buffer[256];
+        int idx = 0;
 
-        while (read(fd_, &ch, 1) > 0) {
-            if (ch == '\n') {
-                buffer[idx] = '\0';
-                double value = atof(buffer);
-                int joint_id = static_cast<int>(value / 1000);
-                double angle = value - joint_id * 1000;
+        while (rclcpp::ok() && running_) {
+            ssize_t n = read(fd_, &ch, 1);
+            if (n > 0) {
+                if (ch == '\n') {
+                    buffer[idx] = '\0';
 
-                if (joint_id >= 0 && joint_id < 5) {
-                    if(angle != 0){
-                        joint_state_.position[joint_id] = angle;
+                    char* endptr = nullptr;
+                    double value = std::strtod(buffer, &endptr);
+                    if (endptr != buffer) {
+                        int joint_id = static_cast<int>(value / 1000);
+                        double angle = value - joint_id * 1000;
+
+                        if (joint_id >= 0 && joint_id < 5) {
+                            if (angle != 0.0) {
+                                joint_state_.position[joint_id] = angle;
+                            }
+
+                            joint_state_.header.stamp = this->get_clock()->now();
+                            joint_pub_->publish(joint_state_);
+                        }
                     }
-                    
-                }
 
-                joint_state_.header.stamp = this->get_clock()->now();
-                joint_pub_->publish(joint_state_);
-                idx = 0;
-                break;
-            } else if (ch != '\r' && idx < sizeof(buffer) - 1) {
-                buffer[idx++] = ch;
+                    idx = 0;
+                } else if (ch != '\r' && idx < static_cast<int>(sizeof(buffer) - 1)) {
+                    buffer[idx++] = ch;
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
         }
     }
 
     int fd_;
-    rclcpp::TimerBase::SharedPtr timer_;
+    bool running_;
+    std::thread read_thread_;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
     sensor_msgs::msg::JointState joint_state_;
 };
